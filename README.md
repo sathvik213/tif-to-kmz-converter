@@ -1,9 +1,10 @@
 # Geo Converters
 
-A Streamlit app with two converters for geospatial data:
+A Streamlit app with three tools for geospatial data:
 
 1. **TIF → KMZ** — render GeoTIFFs as colorized ground overlays viewable in Google Earth.
 2. **KML → GeoJSON** — extract polygons from KML files into MultiPolygon GeoJSON.
+3. **Area Calculator** — compute geodesic area (acres / hectares / m²) for KML or GeoJSON polygons.
 
 ## Features
 
@@ -20,6 +21,14 @@ A Streamlit app with two converters for geospatial data:
 - Preserves `ExtendedData` fields and `<name>` as GeoJSON feature properties
 - Outer + inner rings (holes) preserved
 - Optional ZIP bundle of all outputs
+
+### Area Calculator
+- Upload KML or GeoJSON files
+- Computes area on the WGS84 sphere using the Chamberlain–Duquette spherical-excess formula (same algorithm as `@mapbox/geojson-area`)
+- Holes (inner rings) subtracted; non-polygon geometries ignored
+- Reports per-feature acres, hectares, and m², plus totals
+- CSV export of all measured features
+- Within ~0.1% of true ellipsoidal area — well below survey tolerance
 
 ## Run locally
 

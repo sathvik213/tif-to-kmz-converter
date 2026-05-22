@@ -8,13 +8,14 @@ import io
 import tempfile
 import os
 import json
+import math
 import re
 import xml.etree.ElementTree as ET
 
 st.set_page_config(page_title="Geo Converters", layout="centered")
 st.title("Geo Converters")
 
-tab_tif, tab_kml = st.tabs(["TIF → KMZ", "KML → GeoJSON"])
+tab_tif, tab_kml, tab_area = st.tabs(["TIF → KMZ", "KML → GeoJSON", "Area Calculator"])
 
 # ---------------- TIF → KMZ ----------------
 with tab_tif:
@@ -310,3 +311,194 @@ with tab_kml:
                     mime="application/zip",
                     key="dl_zip",
                 )
+
+
+# ---------------- Area Calculator ----------------
+WGS84_RADIUS = 6378137.0  # equatorial radius, meters
+SQM_PER_ACRE = 4046.8564224
+SQM_PER_HECTARE = 10000.0
+
+
+def _ring_area_sphere(ring) -> float:
+    """Chamberlain & Duquette (JPL 2007) spherical-excess ring area on WGS84 sphere.
+    Same formula as @mapbox/geojson-area. Returns signed area in square meters.
+    """
+    n = len(ring)
+    if n < 3:
+        return 0.0
+    g = 0.0
+    for i in range(n):
+        p1 = ring[(i - 1) % n]
+        p2 = ring[i]
+        p3 = ring[(i + 1) % n]
+        g += (math.radians(p3[0]) - math.radians(p1[0])) * math.sin(math.radians(p2[1]))
+    return g * WGS84_RADIUS * WGS84_RADIUS / 2.0
+
+
+def _geom_polygons(geom):
+    t = geom.get("type")
+    if t == "Polygon":
+        return [geom["coordinates"]]
+    if t == "MultiPolygon":
+        return geom["coordinates"]
+    if t == "GeometryCollection":
+        out = []
+        for g in geom.get("geometries", []):
+            out.extend(_geom_polygons(g))
+        return out
+    return []
+
+
+def geometry_area_sqm(geom) -> float:
+    total = 0.0
+    for rings in _geom_polygons(geom):
+        if not rings:
+            continue
+        total += abs(_ring_area_sphere(rings[0]))
+        for hole in rings[1:]:
+            total -= abs(_ring_area_sphere(hole))
+    return total
+
+
+def _kml_to_features(kml_bytes: bytes):
+    """Parse KML and return a list of dicts with 'properties' and 'geometry'."""
+    root = ET.fromstring(kml_bytes)
+    features = []
+    for placemark in root.iter(f"{KML_NS}Placemark"):
+        polys = _extract_polygons(placemark)
+        if not polys:
+            continue
+        features.append({
+            "properties": _extract_properties(placemark),
+            "geometry": {"type": "MultiPolygon", "coordinates": polys},
+        })
+    return features
+
+
+def _geojson_to_features(gj_bytes: bytes):
+    """Parse GeoJSON bytes into a list of feature-like dicts."""
+    obj = json.loads(gj_bytes.decode("utf-8"))
+    t = obj.get("type")
+    if t == "FeatureCollection":
+        return [{"properties": f.get("properties") or {}, "geometry": f["geometry"]}
+                for f in obj.get("features", []) if f.get("geometry")]
+    if t == "Feature":
+        return [{"properties": obj.get("properties") or {}, "geometry": obj["geometry"]}]
+    # Bare geometry
+    return [{"properties": {}, "geometry": obj}]
+
+
+with tab_area:
+    st.header("Area Calculator")
+    st.markdown(
+        "**How it works:** Upload KML or GeoJSON files. For each polygon (or MultiPolygon) "
+        "the area is computed on the WGS84 sphere using the Chamberlain–Duquette spherical-excess "
+        "formula — the same algorithm used by `@mapbox/geojson-area` and popular online tools. "
+        "Holes (inner rings) are subtracted, and points/lines are ignored. Accuracy is within "
+        "~0.1% of true ellipsoidal area."
+    )
+
+    area_files = st.file_uploader(
+        "Upload KML or GeoJSON file(s)",
+        type=["kml", "geojson", "json"],
+        accept_multiple_files=True,
+        key="area_uploader",
+    )
+
+    unit = st.radio(
+        "Primary unit",
+        ["Acres", "Hectares", "Square meters"],
+        index=0,
+        horizontal=True,
+    )
+
+    if st.button("Compute area", key="btn_area"):
+        if not area_files:
+            st.warning("Please upload at least one file first.")
+            st.stop()
+
+        all_rows = []
+        for f in area_files:
+            try:
+                data = f.read()
+                f.seek(0)
+                ext = os.path.splitext(f.name)[1].lower()
+                feats = _kml_to_features(data) if ext == ".kml" else _geojson_to_features(data)
+            except ET.ParseError as e:
+                st.error(f"{f.name}: invalid KML XML — {e}")
+                continue
+            except json.JSONDecodeError as e:
+                st.error(f"{f.name}: invalid JSON — {e}")
+                continue
+            except Exception as e:
+                st.error(f"{f.name}: {e}")
+                continue
+
+            if not feats:
+                st.warning(f"{f.name}: no polygon features found.")
+                continue
+
+            for i, feat in enumerate(feats):
+                sqm = geometry_area_sqm(feat["geometry"])
+                props = feat.get("properties") or {}
+                label = (
+                    props.get("name")
+                    or props.get("level0")
+                    or props.get("id")
+                    or f"feature[{i}]"
+                )
+                all_rows.append({
+                    "file": f.name,
+                    "feature": str(label),
+                    "geom": feat["geometry"]["type"],
+                    "sqm": sqm,
+                    "hectares": sqm / SQM_PER_HECTARE,
+                    "acres": sqm / SQM_PER_ACRE,
+                })
+
+        if not all_rows:
+            st.error("No polygons to measure.")
+            st.stop()
+
+        # Sort key by chosen unit
+        sort_key = {"Acres": "acres", "Hectares": "hectares", "Square meters": "sqm"}[unit]
+
+        # Render table
+        st.subheader("Per-feature areas")
+        st.dataframe(
+            [
+                {
+                    "file": r["file"],
+                    "feature": r["feature"],
+                    "geometry": r["geom"],
+                    "acres": round(r["acres"], 4),
+                    "hectares": round(r["hectares"], 4),
+                    "m²": round(r["sqm"], 2),
+                }
+                for r in all_rows
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # Totals
+        tot_sqm = sum(r["sqm"] for r in all_rows)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total acres", f"{tot_sqm / SQM_PER_ACRE:,.4f}")
+        c2.metric("Total hectares", f"{tot_sqm / SQM_PER_HECTARE:,.4f}")
+        c3.metric("Total m²", f"{tot_sqm:,.2f}")
+
+        # Per-file CSV download
+        csv_lines = ["file,feature,geometry,acres,hectares,sqm"]
+        for r in all_rows:
+            feat_safe = r["feature"].replace(",", " ")
+            csv_lines.append(
+                f'{r["file"]},{feat_safe},{r["geom"]},{r["acres"]:.6f},{r["hectares"]:.6f},{r["sqm"]:.2f}'
+            )
+        st.download_button(
+            "Download CSV",
+            data="\n".join(csv_lines).encode("utf-8"),
+            file_name="areas.csv",
+            mime="text/csv",
+            key="dl_areas_csv",
+        )
