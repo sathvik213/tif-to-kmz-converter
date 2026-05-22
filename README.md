@@ -1,14 +1,25 @@
-# TIF to KMZ Converter
+# Geo Converters
 
-A Streamlit app that converts GeoTIFF files into KMZ files for viewing in Google Earth.
+A Streamlit app with two converters for geospatial data:
+
+1. **TIF → KMZ** — render GeoTIFFs as colorized ground overlays viewable in Google Earth.
+2. **KML → GeoJSON** — extract polygons from KML files into MultiPolygon GeoJSON.
 
 ## Features
 
+### TIF → KMZ
 - Upload one or more GeoTIFF files
 - Choose from multiple colormaps (YlGnBu, viridis, RdYlGn, etc.)
 - Adjustable pixel upscale factor for crisp rendering in Google Earth
 - Configurable nodata threshold
 - Download KMZ files with transparent nodata regions
+
+### KML → GeoJSON
+- Upload one or more KML files
+- Output as a single `MultiPolygon` feature per file (default) or one feature per Placemark
+- Preserves `ExtendedData` fields and `<name>` as GeoJSON feature properties
+- Outer + inner rings (holes) preserved
+- Optional ZIP bundle of all outputs
 
 ## Run locally
 
