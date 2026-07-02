@@ -10,12 +10,15 @@ import os
 import json
 import math
 import re
+import glob
 import xml.etree.ElementTree as ET
 
 st.set_page_config(page_title="Geo Converters", layout="centered")
 st.title("Geo Converters")
 
-tab_tif, tab_kml, tab_area = st.tabs(["TIF → KMZ", "KML → GeoJSON", "Area Calculator"])
+tab_tif, tab_kml, tab_area, tab_shp = st.tabs(
+    ["TIF → KMZ", "KML → GeoJSON", "KML/GeoJSON → Acreage", "Shapefile ZIP → Acreage"]
+)
 
 # ---------------- TIF → KMZ ----------------
 with tab_tif:
@@ -389,7 +392,7 @@ def _geojson_to_features(gj_bytes: bytes):
 
 
 with tab_area:
-    st.header("Area Calculator")
+    st.header("KML/GeoJSON → Acreage")
     st.markdown(
         "**How it works:** Upload KML or GeoJSON files. For each polygon (or MultiPolygon) "
         "the area is computed on the WGS84 sphere using the Chamberlain–Duquette spherical-excess "
@@ -501,4 +504,188 @@ with tab_area:
             file_name="areas.csv",
             mime="text/csv",
             key="dl_areas_csv",
+        )
+
+
+# ---------------- Shapefile ZIP → Acreage ----------------
+def _reproject_coords(coords, transformer):
+    """Recursively transform a GeoJSON coordinate array in-place-ish.
+    A coordinate is a [x, y] pair; anything else is a nested list of coords."""
+    if not coords:
+        return coords
+    if isinstance(coords[0], (int, float)):
+        x, y = transformer.transform(coords[0], coords[1])
+        return [x, y]
+    return [_reproject_coords(c, transformer) for c in coords]
+
+
+def _shapefile_zip_to_features(zip_bytes: bytes):
+    """Extract a zipped shapefile, read its polygons, and return feature dicts
+    with geometry reprojected to WGS84 (EPSG:4326) lon/lat.
+
+    Returns (features, crs_label). Raises ValueError if no .shp is found.
+    """
+    import shapefile  # pyshp
+    from pyproj import CRS, Transformer
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            zf.extractall(tmpdir)
+
+        shp_paths = glob.glob(os.path.join(tmpdir, "**", "*.shp"), recursive=True)
+        if not shp_paths:
+            raise ValueError("no .shp file found inside the ZIP")
+
+        features = []
+        crs_labels = []
+        for shp_path in shp_paths:
+            base = os.path.splitext(shp_path)[0]
+
+            # Figure out the source CRS from the sidecar .prj (WGS84 if absent).
+            prj_path = base + ".prj"
+            transformer = None
+            if os.path.exists(prj_path):
+                with open(prj_path, "r", encoding="utf-8", errors="replace") as pf:
+                    wkt = pf.read()
+                try:
+                    src_crs = CRS.from_wkt(wkt)
+                    crs_labels.append(src_crs.name)
+                    if not src_crs.is_geographic:
+                        transformer = Transformer.from_crs(
+                            src_crs, CRS.from_epsg(4326), always_xy=True
+                        )
+                except Exception:
+                    crs_labels.append("unknown (.prj unreadable)")
+            else:
+                crs_labels.append("assumed WGS84 (no .prj)")
+
+            reader = shapefile.Reader(shp_path)
+            field_names = [f[0] for f in reader.fields[1:]]  # skip DeletionFlag
+            for sr in reader.shapeRecords():
+                geom = sr.shape.__geo_interface__
+                if geom.get("type") not in ("Polygon", "MultiPolygon"):
+                    continue
+                if transformer is not None:
+                    geom = {
+                        "type": geom["type"],
+                        "coordinates": _reproject_coords(geom["coordinates"], transformer),
+                    }
+                props = dict(zip(field_names, sr.record))
+                features.append({"properties": props, "geometry": geom})
+            reader.close()
+
+        crs_label = ", ".join(sorted(set(crs_labels))) if crs_labels else "unknown"
+        return features, crs_label
+
+
+with tab_shp:
+    st.header("Shapefile ZIP → Acreage")
+    st.markdown(
+        "**How it works:** Upload a **zipped** shapefile (a `.zip` containing at least "
+        "`.shp`, `.shx`, `.dbf` — plus `.prj` for the coordinate system). Each polygon is "
+        "reprojected to WGS84 and measured with the same Chamberlain–Duquette spherical-excess "
+        "formula used by the Area Calculator tab, so the acreage matches. If the `.prj` is "
+        "missing, coordinates are assumed to already be WGS84 lon/lat."
+    )
+
+    shp_files = st.file_uploader(
+        "Upload zipped shapefile(s)",
+        type=["zip"],
+        accept_multiple_files=True,
+        key="shp_uploader",
+    )
+
+    shp_unit = st.radio(
+        "Primary unit",
+        ["Acres", "Hectares", "Square meters"],
+        index=0,
+        horizontal=True,
+        key="shp_unit",
+    )
+
+    if st.button("Compute acreage", key="btn_shp"):
+        if not shp_files:
+            st.warning("Please upload at least one zipped shapefile first.")
+            st.stop()
+
+        all_rows = []
+        for f in shp_files:
+            try:
+                data = f.read()
+                f.seek(0)
+                feats, crs_label = _shapefile_zip_to_features(data)
+            except zipfile.BadZipFile:
+                st.error(f"{f.name}: not a valid ZIP file.")
+                continue
+            except ValueError as e:
+                st.error(f"{f.name}: {e}")
+                continue
+            except Exception as e:
+                st.error(f"{f.name}: {e}")
+                continue
+
+            if not feats:
+                st.warning(f"{f.name}: no polygon features found.")
+                continue
+
+            st.caption(f"{f.name}: CRS = {crs_label}")
+            for i, feat in enumerate(feats):
+                sqm = geometry_area_sqm(feat["geometry"])
+                props = feat.get("properties") or {}
+                label = (
+                    props.get("name")
+                    or props.get("Name")
+                    or props.get("NAME")
+                    or props.get("id")
+                    or props.get("ID")
+                    or f"feature[{i}]"
+                )
+                all_rows.append({
+                    "file": f.name,
+                    "feature": str(label),
+                    "geom": feat["geometry"]["type"],
+                    "sqm": sqm,
+                    "hectares": sqm / SQM_PER_HECTARE,
+                    "acres": sqm / SQM_PER_ACRE,
+                })
+
+        if not all_rows:
+            st.error("No polygons to measure.")
+            st.stop()
+
+        st.subheader("Per-feature areas")
+        st.dataframe(
+            [
+                {
+                    "file": r["file"],
+                    "feature": r["feature"],
+                    "geometry": r["geom"],
+                    "acres": round(r["acres"], 4),
+                    "hectares": round(r["hectares"], 4),
+                    "m²": round(r["sqm"], 2),
+                }
+                for r in all_rows
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        tot_sqm = sum(r["sqm"] for r in all_rows)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total acres", f"{tot_sqm / SQM_PER_ACRE:,.4f}")
+        c2.metric("Total hectares", f"{tot_sqm / SQM_PER_HECTARE:,.4f}")
+        c3.metric("Total m²", f"{tot_sqm:,.2f}")
+
+        csv_lines = ["file,feature,geometry,acres,hectares,sqm"]
+        for r in all_rows:
+            feat_safe = r["feature"].replace(",", " ")
+            csv_lines.append(
+                f'{r["file"]},{feat_safe},{r["geom"]},{r["acres"]:.6f},{r["hectares"]:.6f},{r["sqm"]:.2f}'
+            )
+        st.download_button(
+            "Download CSV",
+            data="\n".join(csv_lines).encode("utf-8"),
+            file_name="shapefile_areas.csv",
+            mime="text/csv",
+            key="dl_shp_csv",
         )

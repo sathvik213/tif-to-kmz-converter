@@ -3,3 +3,5 @@ rasterio
 numpy
 matplotlib
 Pillow
+pyshp
+pyproj
