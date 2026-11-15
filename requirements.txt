@@ -5,3 +5,7 @@ matplotlib
 Pillow
 pyshp
 pyproj
+requests
+shapely
+folium
+streamlit-folium

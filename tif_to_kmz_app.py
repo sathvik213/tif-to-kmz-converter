@@ -16,8 +16,9 @@ import xml.etree.ElementTree as ET
 st.set_page_config(page_title="Geo Converters", layout="centered")
 st.title("Geo Converters")
 
-tab_tif, tab_kml, tab_area, tab_shp = st.tabs(
-    ["TIF → KMZ", "KML → GeoJSON", "KML/GeoJSON → Acreage", "Shapefile ZIP → Acreage"]
+tab_tif, tab_kml, tab_area, tab_shp, tab_legal = st.tabs(
+    ["TIF → KMZ", "KML → GeoJSON", "KML/GeoJSON → Acreage", "Shapefile ZIP → Acreage",
+     "Legal → Boundary"]
 )
 
 # ---------------- TIF → KMZ ----------------
@@ -688,4 +689,215 @@ with tab_shp:
             file_name="shapefile_areas.csv",
             mime="text/csv",
             key="dl_shp_csv",
+        )
+
+
+# ---------------- Legal → Boundary ----------------
+import plss
+
+
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def _cached_meridians(state: str):
+    return plss.meridians_for_state(state)
+
+
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def _cached_lookup(legal_text: str, state: str, meridian: str):
+    return plss.lookup(plss.parse_legal(legal_text), state, meridian)
+
+
+def _drawn_feature_rows(drawings, legal_features):
+    """Attach the overlapping legal + acreage to each drawn polygon."""
+    from shapely.geometry import shape as _shape
+
+    legal_shapes = [(f["properties"]["legal"], _shape(f["geometry"])) for f in legal_features]
+    rows = []
+    for d in drawings or []:
+        geom = d.get("geometry") or {}
+        if geom.get("type") not in ("Polygon", "MultiPolygon"):
+            continue
+        g = _shape(geom)
+        overlaps = [name for name, ls in legal_shapes if ls.intersects(g)]
+        rows.append({
+            "geometry": geom,
+            "legal": ", ".join(overlaps),
+            "acres": geometry_area_sqm(geom) / SQM_PER_ACRE,
+        })
+    return rows
+
+
+with tab_legal:
+    import folium
+    from folium.plugins import Draw
+    from streamlit_folium import st_folium
+
+    st.header("Legal Description → Field Boundary")
+    st.markdown(
+        "**How it works:** Enter one or more PLSS legal descriptions (one per line), e.g. "
+        "`NE4NW4 Sec 12 T5N R3W` or `E2SW4 12-5N-3W`. The boundary is fetched from the BLM "
+        "National PLSS dataset and drawn on satellite imagery. Then use the polygon / "
+        "rectangle tools on the map to trace the actual field and download it as GeoJSON."
+    )
+    st.caption(
+        "PLSS states only — Texas, the original 13 colonies, KY, TN, WV, VT, ME and HI use "
+        "metes-and-bounds and won't resolve. Aliquot parts come from BLM quarter-quarter "
+        "polygons where published; otherwise the section is split evenly (approximate)."
+    )
+
+    states = sorted(plss.PLSS_STATES.items(), key=lambda kv: kv[1])
+    c1, c2 = st.columns(2)
+    state = c1.selectbox(
+        "State",
+        [abbr for abbr, _ in states],
+        index=[abbr for abbr, _ in states].index("NE"),
+        format_func=lambda a: f"{plss.PLSS_STATES[a]} ({a})",
+        key="legal_state",
+    )
+    try:
+        meridians = _cached_meridians(state)
+    except plss.PLSSError as e:
+        st.error(str(e))
+        meridians = []
+    meridian = c2.selectbox(
+        "Principal meridian",
+        [code for code, _ in meridians] or ["06"],
+        format_func=lambda c: next((f"{n} ({c})" for code, n in meridians if code == c), c),
+        key="legal_meridian",
+        help="Used when the legal text doesn't name a meridian (e.g. '6th P.M.').",
+    )
+
+    legal_text = st.text_area(
+        "Legal description(s) — one per line",
+        placeholder="NW4 Sec 12 T5N R3W\nE2SW4 Sec 13 T5N R3W",
+        height=110,
+        key="legal_text",
+    )
+
+    if st.button("Show on map", key="btn_legal"):
+        lines = [ln for ln in legal_text.splitlines() if ln.strip()]
+        if not lines:
+            st.warning("Enter at least one legal description.")
+        else:
+            features, errors = [], []
+            with st.spinner("Looking up legals from BLM PLSS…"):
+                for ln in lines:
+                    try:
+                        features.append(_cached_lookup(ln.strip(), state, meridian))
+                    except plss.PLSSError as e:
+                        errors.append(f"`{ln.strip()}` — {e}")
+            st.session_state["legal_features"] = features
+            st.session_state["legal_errors"] = errors
+
+    legal_features = st.session_state.get("legal_features", [])
+    for err in st.session_state.get("legal_errors", []):
+        st.error(err)
+
+    if legal_features:
+        st.dataframe(
+            [
+                {
+                    "legal": f["properties"]["legal"],
+                    "acres": round(geometry_area_sqm(f["geometry"]) / SQM_PER_ACRE, 2),
+                    "source": f["properties"]["source"],
+                }
+                for f in legal_features
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    # Map
+    m = folium.Map(location=[39.5, -98.35], zoom_start=4, tiles=None, control_scale=True)
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri World Imagery",
+        name="Satellite",
+    ).add_to(m)
+    folium.TileLayer("OpenStreetMap", name="Streets", show=False).add_to(m)
+
+    if legal_features:
+        fc = {"type": "FeatureCollection", "features": legal_features}
+        folium.GeoJson(
+            fc,
+            name="Legal boundaries",
+            style_function=lambda _: {"color": "#ffd400", "weight": 3, "fillOpacity": 0.08},
+            # Non-interactive so clicks fall through to the draw tool.
+            interactive=False,
+        ).add_to(m)
+        from shapely.geometry import shape as _shape
+        from shapely.ops import unary_union as _union
+
+        minx, miny, maxx, maxy = _union([_shape(f["geometry"]) for f in legal_features]).bounds
+        m.fit_bounds([[miny, minx], [maxy, maxx]])
+
+    Draw(
+        export=False,
+        draw_options={
+            "polyline": False,
+            "circle": False,
+            "circlemarker": False,
+            "marker": False,
+            "polygon": {"allowIntersection": False, "showArea": True},
+            "rectangle": True,
+        },
+        edit_options={"edit": True, "remove": True},
+    ).add_to(m)
+    folium.LayerControl(collapsed=True).add_to(m)
+
+    map_state = st_folium(
+        m,
+        key="legal_map",
+        height=560,
+        use_container_width=True,
+        returned_objects=["all_drawings"],
+    )
+
+    # Drawn boundaries
+    drawn = _drawn_feature_rows((map_state or {}).get("all_drawings"), legal_features)
+    st.subheader("Drawn boundaries")
+    if not drawn:
+        st.info("Use the polygon or rectangle tool (left side of the map) to draw the field boundary.")
+    else:
+        field_name = st.text_input("Boundary name", value="field", key="legal_field_name")
+        st.dataframe(
+            [
+                {"#": i + 1, "legal": r["legal"] or "—", "acres": round(r["acres"], 2)}
+                for i, r in enumerate(drawn)
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.metric("Total drawn acres", f"{sum(r['acres'] for r in drawn):,.2f}")
+
+        out_fc = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "name": field_name if len(drawn) == 1 else f"{field_name}_{i + 1}",
+                        "legal": r["legal"],
+                        "acres": round(r["acres"], 4),
+                    },
+                    "geometry": r["geometry"],
+                }
+                for i, r in enumerate(drawn)
+            ],
+        }
+        safe_name = re.sub(r"[^\w\-]+", "_", field_name).strip("_") or "field"
+        st.download_button(
+            "Download drawn boundary (GeoJSON)",
+            data=json.dumps(out_fc, indent=2).encode("utf-8"),
+            file_name=f"{safe_name}.geojson",
+            mime="application/geo+json",
+            key="dl_drawn_geojson",
+        )
+
+    if legal_features:
+        st.download_button(
+            "Download legal boundaries (GeoJSON)",
+            data=json.dumps({"type": "FeatureCollection", "features": legal_features}, indent=2).encode("utf-8"),
+            file_name="legal_boundaries.geojson",
+            mime="application/geo+json",
+            key="dl_legal_geojson",
         )
